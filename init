@@ -128,7 +128,8 @@ def main(args):
     exit_code = None
     exit_status = None
 
-    log.info('Running %s...' % ' '.join(args.main_command))
+    log.info('Starting ...')
+    log.info(' '.join(args.main_command))
     pid = os.spawnvp(
         os.P_NOWAIT, args.main_command[0], args.main_command)
 
