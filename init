@@ -1,0 +1,199 @@
+#!/usr/bin/python3 -u
+
+
+import argparse
+import logging
+import signal
+import errno
+import sys
+import os
+
+
+log = logging.getLogger('init')
+
+
+KILL_PROCESS_TIMEOUT = 5
+KILL_ALL_PROCESSES_TIMEOUT = 5
+
+
+terminated_child_processes = {}
+
+
+class AlarmException(Exception):
+    pass
+
+
+def ignore_signals_and_raise_keyboard_interrupt(signame):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    raise KeyboardInterrupt(signame)
+
+
+def raise_alarm_exception():
+    raise AlarmException('Alarm')
+
+
+# Waits for the child process with the given PID, while at the same time
+# reaping any other child processes that have exited (e.g. adopted child
+# processes that have terminated).
+def waitpid_reap_other_children(pid):
+    global terminated_child_processes
+
+    status = terminated_child_processes.get(pid)
+    if status:
+        # A previous call to waitpid_reap_other_children(),
+        # with an argument not equal to the current argument,
+        # already waited for this process. Return the status
+        # that was obtained back then.
+        del terminated_child_processes[pid]
+        return status
+
+    done = False
+    status = None
+    while not done:
+        try:
+            this_pid, status = os.waitpid(-1, 0)
+            if this_pid == pid:
+                done = True
+            else:
+                # Save status for later.
+                terminated_child_processes[this_pid] = status
+        except OSError as e:
+            if e.errno == errno.ECHILD or e.errno == errno.ESRCH:
+                return None
+            else:
+                raise
+    return status
+
+
+def stop_child_process(
+        name, pid, signo=signal.SIGTERM, time_limit=KILL_PROCESS_TIMEOUT):
+    log.info('Shutting down %s (PID %d)...' % (name, pid))
+    try:
+        os.kill(pid, signo)
+    except OSError:
+        pass
+    signal.alarm(time_limit)
+    try:
+        try:
+            waitpid_reap_other_children(pid)
+        except OSError:
+            pass
+    except AlarmException:
+        log.warn(
+            '%s (PID %d) did not shut down in time. Forcing it to exit.' % (
+                name, pid))
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            waitpid_reap_other_children(pid)
+        except OSError:
+            pass
+    finally:
+        signal.alarm(0)
+
+
+def kill_all_processes(time_limit):
+    log.info('Killing all processes...')
+    try:
+        os.kill(-1, signal.SIGTERM)
+    except OSError:
+        pass
+    signal.alarm(time_limit)
+    try:
+        # Wait until no more child processes exist.
+        done = False
+        while not done:
+            try:
+                os.waitpid(-1, 0)
+            except OSError as e:
+                if e.errno == errno.ECHILD:
+                    done = True
+                else:
+                    raise
+    except AlarmException:
+        log.warn(
+            'Not all processes have exited in time. Forcing them to exit.')
+        try:
+            os.kill(-1, signal.SIGKILL)
+        except OSError:
+            pass
+    finally:
+        signal.alarm(0)
+
+
+def main(args):
+    exit_code = None
+    exit_status = None
+
+    log.info('Running %s...' % ' '.join(args.main_command))
+    pid = os.spawnvp(
+        os.P_NOWAIT, args.main_command[0], args.main_command)
+
+    try:
+        exit_code = waitpid_reap_other_children(pid)
+        if exit_code is None:
+            log.info(
+                '%s exited with unknown status.' %
+                args.main_command[0])
+            exit_status = 1
+        else:
+            exit_status = os.WEXITSTATUS(exit_code)
+            log.info('%s exited with status %d.' % (
+                args.main_command[0], exit_status))
+    except KeyboardInterrupt:
+        stop_child_process(args.main_command[0], pid)
+        raise
+    except BaseException:
+        log.warn('An error occurred. Aborting.')
+        stop_child_process(args.main_command[0], pid)
+        raise
+
+    sys.exit(exit_status)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Initialize the system.')
+    parser.add_argument(
+        'main_command', metavar='MAIN_COMMAND', type=str, nargs='*',
+        help='The main command to run.')
+    parser.add_argument(
+        '--no-kill-all-on-exit', dest='kill_all_on_exit',
+        action='store_const', const=False, default=True,
+        help='Don\'t kill all processes on the system upon exiting')
+    parser.add_argument(
+        '--quiet', dest='log_level',
+        action='store_const', const='WARN', default='INFO',
+        help='Only print warnings and errors')
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level={'WARN': logging.WARN, 'INFO': logging.INFO}[args.log_level])
+
+    if len(args.main_command) == 0:
+        log.error('you must also pass a main command.')
+        sys.exit(1)
+
+    signal.signal(
+        signal.SIGTERM,
+        lambda signum, frame:
+            ignore_signals_and_raise_keyboard_interrupt('SIGTERM'))
+    signal.signal(
+        signal.SIGINT,
+        lambda signum, frame:
+            ignore_signals_and_raise_keyboard_interrupt('SIGINT'))
+    signal.signal(
+        signal.SIGALRM,
+        lambda signum, frame: raise_alarm_exception())
+
+    try:
+        main(args)
+    except KeyboardInterrupt:
+        log.warn('Init system aborted.')
+        exit(2)
+    finally:
+        if args.kill_all_on_exit:
+            kill_all_processes(KILL_ALL_PROCESSES_TIMEOUT)
